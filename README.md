@@ -1,0 +1,2 @@
+### EG-RIP: Entropy-Guided Residual Importance Pruning
+A novel pruning framework combining entropy-based static selection, GMM-guided dynamic importance estimation, and residual energy propagation across layers, tailored for multi-task pruning in large language models.
