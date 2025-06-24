@@ -85,7 +85,8 @@ class FFNAccessor:
         Returns:
             List[Tensor]: List of weight tensors for the specified Linear layers.
         """
-        return [self.get_layer_module(i, tag).weight for i in range(len(self.model.language_model.model.layers))]
+        weights =  [self.get_layer_module(i, tag).weight for i in range(len(self.model.language_model.model.layers))]
+        return torch.stack(weights)
     
     def compute_mlp_activate(self, activations, num_layers):
         """
@@ -107,8 +108,9 @@ class FFNAccessor:
         for i in range(num_layers):
             gate = activations[f"layer.{i}.{gate_name}"]
             up = activations[f"layer.{i}.{up_name}"]
-            act.append(F.silu(gate) * up)
-        return act
+            activation = F.silu(gate) * up
+            act.append(activation.squeeze(0))
+        return torch.stack(act)
 
     def prune_linear_channel(self, linear_layer, selected_channel, prune_dim):
         """
@@ -144,13 +146,13 @@ class FFNAccessor:
         return new_linear
 
     @torch.no_grad()
-    def apply_mlp_prune(self, sample_idx):
+    def apply_mlp_prune(self, channel_info):
         """
         Apply channel pruning to MLP layers (gate, down, up) in all transformer layers,
         replacing the original linear layers with pruned versions.
 
         Args:
-            sample_idx (List[Tensor]): List of channel indices to keep for each layer.
+            channel_info (List[Tensor]): List of channel indices to keep for each layer.
 
         Returns:
             model: A deepcopy of the original model with pruned MLP layers replaced.
@@ -159,9 +161,9 @@ class FFNAccessor:
         self.model = copy.deepcopy(self.model)
 
         for layer_idx, (gate, down, up) in self.iterate_layers():
-            new_down = self.prune_linear_channel(down, sample_idx[layer_idx], prune_dim=1)
-            new_up = self.prune_linear_channel(up, sample_idx[layer_idx], prune_dim=0)
-            new_gate = self.prune_linear_channel(gate, sample_idx[layer_idx], prune_dim=0)
+            new_down = self.prune_linear_channel(down, channel_info[layer_idx], prune_dim=1)
+            new_up = self.prune_linear_channel(up, channel_info[layer_idx], prune_dim=0)
+            new_gate = self.prune_linear_channel(gate, channel_info[layer_idx], prune_dim=0)
 
             decoder_layer = self.model.language_model.model.layers[layer_idx]
             # Use model-specific assign function to set new Linear layers
