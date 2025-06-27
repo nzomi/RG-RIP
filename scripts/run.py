@@ -308,7 +308,8 @@ if __name__ == "__main__":
     num_img_per_task = 20
     topk = 4096
     total_channel_to_keep = 4096
-    prune_type = 'entropy'
+    Temperature = 0.8 # low-temp means winner-take-all
+    prune_type = 'mag_entropy'
     # model_type = '9B'
     model_type = '2B'
 
@@ -343,6 +344,8 @@ if __name__ == "__main__":
     all_importance = get_importance(type_name=prune_type, 
                                     weights=all_weights,
                                     activations=all_acts)
+    
+    soft_importance = F.softmax(all_importance/Temperature, dim=-1)
 
     static_channel_to_keep = get_static_channels(all_importance, topk_keep_channel=topk)
     final_channel_to_keep = get_dynamic_channels(all_importance, total_channel_to_keep, static_channel_to_keep)

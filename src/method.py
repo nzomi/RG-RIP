@@ -101,25 +101,24 @@ def hist_entropy(values, bins):
     entropy = -torch.sum(probs * torch.log(probs + 1e-8))
     return entropy
 
+def compute_entropy_per_channel(act: torch.Tensor):
+    """
+    act: shape (m, c)
+    """
+    m, c = act.shape
+    entropies = []
+    for i in range(c):
+        values = act[:, i].abs().cpu()
+        entropy = kde_entropy(values)  # or hist_entropy(values, bins)
+        entropies.append(entropy)
+    return torch.stack(entropies)
+
 @register_importance('entropy')
 def compute_entropy_importance(activations, weights=None, bins=30, gamma_=0.5, lambda_=0.5):
     """
     activations: List[List[Tensor]]  # shape (k tasks, m samples), each: (l, c)
     Returns: Tensor (l, c)
     """
-
-    def compute_entropy_per_channel(act: torch.Tensor):
-        """
-        act: shape (m, c)
-        """
-        m, c = act.shape
-        entropies = []
-        for i in range(c):
-            values = act[:, i].abs().cpu()
-            entropy = kde_entropy(values)  # or hist_entropy(values, bins)
-            entropies.append(entropy)
-        return torch.stack(entropies)
-
     k = len(activations)
     l, c = activations[0][0].shape
 
@@ -137,6 +136,33 @@ def compute_entropy_importance(activations, weights=None, bins=30, gamma_=0.5, l
     mean_entropy = entropy_tensor.mean(dim=0)
     std_entropy = entropy_tensor.std(dim=0, unbiased=False)
     importance = gamma_ * mean_entropy - lambda_ * std_entropy
+    return importance
+
+@register_importance('mag_entropy')
+def compute_mag_entropy_importance(activations, weights, alpha=1.0, beta=0.5):
+    """
+    activations: List[List[Tensor]]  # shape (k tasks, m samples), each: (l, c)
+    Returns: Tensor (l, c)
+    """
+    k = len(activations) # (k, m, l, c)
+    l, c = activations[0][0].shape
+    device = activations[0][0].device
+
+    mag_entropy_per_task = []
+    for task_acts in activations:
+        task_mag_entropy = []
+        for layer_idx in range(l):
+            # stack m samples for this layer
+            act_mat = torch.stack([sample[layer_idx] for sample in task_acts], dim=0)  # (m, c)
+            ent = compute_entropy_per_channel(act_mat).to(device) # (c,)
+            act_mat_mean = act_mat.mean(dim=0).to(device)  # (c,)
+            mag_entropy = (act_mat_mean.abs() ** alpha) * (ent ** beta)
+            task_mag_entropy.append(mag_entropy)
+        mag_entropy_per_task.append(torch.stack(task_mag_entropy))  # (l, c)
+
+    mag_entropy_tensor = torch.stack(mag_entropy_per_task)  # shape (k, l, c)
+    mean_mag_entropy = mag_entropy_tensor.mean(dim=0)
+    importance = mean_mag_entropy
     return importance
 
 if __name__ == '__main__':
