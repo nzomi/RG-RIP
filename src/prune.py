@@ -4,6 +4,12 @@ import torch.nn.functional as F
 
 from config.config import FFN_MAPPING_BY_MODEL_TYPE
 
+import copy
+
+def safe_model_copy(model):
+    device = next(model.parameters()).device
+    return copy.deepcopy(model.cpu()).to(device)
+
 class FFNAccessor:
     """
     A helper class to access and manipulate feed-forward network (FFN) layers
@@ -132,7 +138,8 @@ class FFNAccessor:
             in_features = linear_layer.in_features
 
         bias = linear_layer.bias is not None
-        new_linear = nn.Linear(in_features, out_features, bias=bias)
+        new_linear = nn.Linear(in_features, out_features, bias=bias).to(self.model.device)
+        selected_channel = selected_channel.to(self.model.device)
 
         # Copy selected weights along prune_dim dimension
         new_linear.weight.data.copy_(
@@ -157,8 +164,7 @@ class FFNAccessor:
         Returns:
             model: A deepcopy of the original model with pruned MLP layers replaced.
         """
-        import copy
-        self.model = copy.deepcopy(self.model)
+        self.model = safe_model_copy(self.model)
 
         for layer_idx, (gate, down, up) in self.iterate_layers():
             new_down = self.prune_linear_channel(down, channel_info[layer_idx], prune_dim=1)

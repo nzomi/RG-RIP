@@ -151,7 +151,7 @@ def get_activation(name):
         activations[name] = output.detach()
     return hook_fn
 
-def get_weights_and_acts(accessor, model, img_info, num_layers):
+def get_weights_and_acts(accessor, model, img_info, prompt, num_layers):
     # indices = []
     activations.clear()
     response = model.chat(tokenizer, img_info, prompt, generation_config)
@@ -286,50 +286,63 @@ def print_model_size(model, pruned_model):
     prune_model_params = get_num_parameters(pruned_model, count_nonzero_only=True)
     print(f"Prune model has {prune_model_params/1e9:.2f}B parameters")
 
+def set_up(model_type):
+    if model_type == "9B":
+        model_path = '/data/zige.wang/InternVL3/Running/Full_0620_9B/checkpoint-1640'
+        model, tokenizer = load_model_tokenizer(model_path)
+        accessor = FFNAccessor(model, model_type="internlm2")
+        num_layers = 48
+    elif model_type == "2B":
+        model_path = '/data/prune/src/0530Base'
+        model, tokenizer = load_model_tokenizer(model_path)
+        accessor = FFNAccessor(model, model_type="qwen2")
+        num_layers = 28
+    return model, tokenizer, accessor, num_layers
 if __name__ == "__main__":
-    model_path = '/opt/weight/Tagbar_2B_ver_20250619FVOB'
-    yaml_path = '/home/liyuan.jiang/workspace/table_superior'
-    prompt_type = 'tagbar'
-    imag_path = '/home/liyuan.jiang/filtered'
-    num_img_per_task = 2
-    topk = 2048
-    total_channel_to_keep = 7168
-    num_layers = 28
-    prune_type = 'wanda'
-    model, tokenizer = load_model_tokenizer(model_path)
-    prompt = load_prompt(yaml_path, prompt_type)
+    TABLE_TYPES = [
+            'tagbar'
+        ]
+    yaml_path = '/home/liyuan.jiang/workspace/dataset/config/table_superior'
+    imag_path = '/data/Dataset/filtered'
     generation_config = dict(max_new_tokens=4096, do_sample=False)
-    accessor = FFNAccessor(model, model_type="qwen2")
+    num_img_per_task = 20
+    topk = 4096
+    total_channel_to_keep = 4096
+    prune_type = 'entropy'
+    # model_type = '9B'
+    model_type = '2B'
+
+    model, tokenizer, accessor, num_layers = set_up(model_type)
+
     accessor.register_hooks(get_activation)
 
     all_acts, all_weights = [], []
-
+    ic(model)
     # forward pass
-    for task in ['tagbar']: 
+    for task in TABLE_TYPES: 
+        prompt = load_prompt(yaml_path, task)
         task_acts, task_weights = [], []
         cur_img_path = os.path.join(imag_path, task)
         img_list = get_random_images(cur_img_path, num_img_per_task)
         
         for img in img_list:
             if img.lower().endswith(('.png', '.jpg', '.jpeg')):
+                ic(f'{img}')
                 cur_img_info = load_image(os.path.join(cur_img_path, img)).to(torch.bfloat16).cuda()
-                weights, acts = get_weights_and_acts(accessor, model, cur_img_info, num_layers)
+                weights, acts = get_weights_and_acts(accessor, model, cur_img_info, prompt, num_layers)
                 
                 # weights: list of tensors per layer, shape: (hidden_in, hidden_out)
                 # acts: list of tensors per layer, shape: (1, channels)
-                task_weights.append(weights)  # shape: (num_samples, num_layers, weight_shape...)
-                task_acts.append(acts)        # shape: (num_samples, num_layers, channels)
+                task_weights.append(weights)             # shape: (num_samples, num_layers, weight_shape...)
+                task_acts.append(acts.squeeze(1))        # shape: (num_samples, num_layers, channels)
 
         # stack over sample dimension        
-        all_weights.append(torch.stack(task_weights))  
-        all_acts.append(torch.stack(task_acts))        
-
-    all_weights_as_tensor = torch.stack(all_weights)        # shape: (tasks, num_samples, num_layers, c_h, h——)
-    all_acts_as_tensor = torch.stack(all_acts).squeeze(-2)  # shape: (tasks, num_samples, num_layers, 1, channels)
+        all_weights.append(task_weights)    #(task, num_samples, num_layers, hidden_in, hidden_out)
+        all_acts.append(task_acts)          #(task, num_samples, num_layers, hidden_in, hidden_out)
 
     all_importance = get_importance(type_name=prune_type, 
-                                    weights=all_weights_as_tensor,
-                                    activations=all_acts_as_tensor)
+                                    weights=all_weights,
+                                    activations=all_acts)
 
     static_channel_to_keep = get_static_channels(all_importance, topk_keep_channel=topk)
     final_channel_to_keep = get_dynamic_channels(all_importance, total_channel_to_keep, static_channel_to_keep)

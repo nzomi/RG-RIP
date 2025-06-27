@@ -35,111 +35,116 @@ def get_importance(type_name, weights=None, activations=None, **kwargs):
 @register_importance('weight')
 def compute_weight_importance(weights, activations=None):
     """
-    Compute weight-based importance over batched tasks and layers.
-
-    Args:
-        weights (Tensor): shape (k, m, l, out_dim, in_dim)
-
-    Returns:
-        Tensor: shape (l, in_dim), average importance per layer and input channel
+    weights: List[List[Tensor]] -> shape: (k tasks, m samples) each of shape (l, out, in)
+    Returns: Tensor of shape (l, in)
     """
-    # abs().sum over output dim, then mean over tasks and samples
-    importance = weights.abs().sum(dim=-2).mean(dim=(0, 1))  # shape: (l, in_dim)
-    return importance
+    k = len(weights)
+    m = len(weights[0])
+    l, out_dim, in_dim = weights[0][0].shape
+
+    total = torch.zeros(l, in_dim, device=weights[0][0].device)
+    for task_weights in weights:       # over k
+        for sample in task_weights:    # over m
+            total += sample.abs().sum(dim=1)  # sum over out_dim → shape: (l, in_dim)
+
+    return total / (k * m)
 
 
 @register_importance('activation')
 def compute_activation_importance(activations, weights=None, norm=2):
     """
-    Compute activation-based importance over batched tasks and layers.
-
-    Args:
-        activations (Tensor): shape (k, m, l, in_dim)
-        norm (int): p-norm value (default: 2)
-
-    Returns:
-        Tensor: shape (l, in_dim), average norm importance
+    activations: List[List[Tensor]] -> shape: (k, m) each of shape (l, in)
+    Returns: Tensor of shape (l, in)
     """
-    # norm over batch dim, then mean over tasks and samples
-    norm_vals = torch.norm(activations, dim=1, p=norm)  # shape: (k, l, in_dim)
-    importance = norm_vals.mean(dim=0)  # shape: (l, in_dim)
-    return importance
+    k = len(activations)
+    m = len(activations[0])
+    l, in_dim = activations[0][0].shape
+
+    total = torch.zeros(l, in_dim, device=activations[0][0].device)
+    for task_acts in activations:       # over k
+        for sample in task_acts:        # over m
+            total += sample.norm(p=norm, dim=0)  # norm over batch/sample → shape: (l, in)
+
+    return total / (k * m)
 
 
 @register_importance('wanda')
 def compute_wanda_importance(weights, activations, norm=2):
-    """
-    Compute WANDA-style importance: weight × activation norm.
+    w_imp = compute_weight_importance(weights)
+    a_imp = compute_activation_importance(activations, norm)
+    return w_imp * a_imp
 
+def kde_entropy(values, num_points=100):
+    from scipy.stats import gaussian_kde
+    import numpy as np
+    values_np = values.float().cpu().numpy()
+    kde = gaussian_kde(values_np)
+    xs = np.linspace(values_np.min(), values_np.max(), num_points)
+    probs = kde(xs)
+    probs /= probs.sum() + 1e-8  # normalize (not strictly necessary)
+    entropy = -np.sum(probs * np.log(probs + 1e-8)) * (xs[1] - xs[0]) * 1000
+    return torch.tensor(entropy, dtype=values.dtype, device=values.device)
+
+def hist_entropy(values, bins):
+    """
+    Compute entropy using histogram method.
+    
     Args:
-        weights (Tensor): shape (k, m, l, out_dim, in_dim)
-        activations (Tensor): shape (k, m, l, in_dim)
-        norm (int): p-norm for activation (default: 2)
-
+        values (Tensor): 1D tensor of values
+        bins (int): Number of bins for histogram
+    
     Returns:
-        Tensor: shape (l, in_dim)
+        float: Entropy value
     """
-    w_imp = compute_weight_importance(weights)          # shape: (l, in_dim)
-    a_imp = compute_activation_importance(activations, norm)  # shape: (l, in_dim)
-    return w_imp * a_imp  # shape: (l, in_dim)
+    hist = torch.histc(values, bins=bins, min=values.min().item(), max=values.max().item())
+    probs = hist / (hist.sum() + 1e-8)
+    entropy = -torch.sum(probs * torch.log(probs + 1e-8))
+    return entropy
 
 @register_importance('entropy')
 def compute_entropy_importance(activations, weights=None, bins=30, gamma_=0.5, lambda_=0.5):
     """
-    Compute channel importance for each layer based on entropy across tasks.
-
-    Args:
-        activations (torch.Tensor): shape (k, m, l, c)
-            k: number of tasks
-            m: number of samples per task
-            l: number of layers
-            c: number of channels per layer
-        bins (int): number of histogram bins used to estimate entropy
-        gamma_ (float): weight for mean entropy
-        lambda_ (float): weight for entropy std across tasks
-
-    Returns:
-        importance (torch.Tensor): shape (l, c)
-            Importance score per channel for each layer.
+    activations: List[List[Tensor]]  # shape (k tasks, m samples), each: (l, c)
+    Returns: Tensor (l, c)
     """
 
-    def compute_entropy_per_channel(act_task_layer):
+    def compute_entropy_per_channel(act: torch.Tensor):
         """
-        Compute entropy for each channel in a single task & single layer.
-
-        Args:
-            act_task_layer (torch.Tensor): shape (m, c)
-
-        Returns:
-            entropy_per_channel (torch.Tensor): shape (c,)
+        act: shape (m, c)
         """
-        m, c = act_task_layer.shape
-        entropy_list = []
+        m, c = act.shape
+        entropies = []
         for i in range(c):
-            values = act_task_layer[:, i].cpu()
-            hist = torch.histc(values, bins=bins, min=values.min().item(), max=values.max().item())
-            probs = hist / (hist.sum() + 1e-8)
-            entropy = -torch.sum(probs * torch.log(probs + 1e-8))
-            entropy_list.append(entropy)
-        return torch.stack(entropy_list)
+            values = act[:, i].abs().cpu()
+            entropy = kde_entropy(values)  # or hist_entropy(values, bins)
+            entropies.append(entropy)
+        return torch.stack(entropies)
 
-    k, m, l, c = activations.shape
-    # shape: (k, l, c) -- entropy per task, per layer, per channel
-    entropy_matrix = torch.stack([
-        torch.stack([compute_entropy_per_channel(activations[t, :, lyr]) for lyr in range(l)])
-        for t in range(k)
-    ])  # shape: (k, l, c)
+    k = len(activations)
+    l, c = activations[0][0].shape
 
-    mean_entropy = entropy_matrix.mean(dim=0)  # shape: (l, c)
-    std_entropy = entropy_matrix.std(dim=0)    # shape: (l, c)
+    entropy_per_task = []
+    for task_acts in activations:
+        task_entropy = []
+        for layer_idx in range(l):
+            # stack m samples for this layer
+            act_mat = torch.stack([sample[layer_idx] for sample in task_acts], dim=0)  # (m, c)
+            ent = compute_entropy_per_channel(act_mat)
+            task_entropy.append(ent)
+        entropy_per_task.append(torch.stack(task_entropy))  # (l, c)
 
-    importance = gamma_ * mean_entropy - lambda_ * std_entropy  # shape: (l, c)
+    entropy_tensor = torch.stack(entropy_per_task)  # shape (k, l, c)
+    mean_entropy = entropy_tensor.mean(dim=0)
+    std_entropy = entropy_tensor.std(dim=0, unbiased=False)
+    importance = gamma_ * mean_entropy - lambda_ * std_entropy
     return importance
 
 if __name__ == '__main__':
-    act = torch.randn(1, 2, 28, 8960)
-    weights = torch.randn(1, 2, 28, 1536, 8960)
-    multi_act = torch.randn(3, 2, 28, 8960)
+    act = [[torch.randn(28, 8960), torch.randn(28, 8960)]]
+    weights = [[torch.randn(28, 1536, 8960), torch.randn(28, 1536, 8960)]]
+    multi_act = [[torch.randn(28, 8960), torch.randn(28, 8960)],
+                 [torch.randn(28, 8960), torch.randn(28, 8960)],
+                 [torch.randn(28, 8960), torch.randn(28, 8960)],]
     importance_e = get_importance('entropy', activations=multi_act)
     importance_a = get_importance('activation', activations=act)
     importance_w = get_importance('weight', weights=weights)
